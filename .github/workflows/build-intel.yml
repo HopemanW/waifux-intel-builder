@@ -1,0 +1,194 @@
+name: Build WaifuX Intel Video + Web
+
+on:
+  workflow_dispatch:
+    inputs:
+      waifux_version:
+        description: "WaifuX version without v (example: 38.0.143)"
+        required: true
+        default: "38.0.143"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - name: Show Intel macOS build environment
+        run: |
+          set -euxo pipefail
+          uname -m
+          sw_vers
+          xcodebuild -version
+          swiftc --version
+
+      - name: Clone matching WaifuX release
+        env:
+          VERSION: ${{ inputs.waifux_version }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "v${VERSION}" https://github.com/jipika/WaifuX.git WaifuX
+
+      - name: Patch ARM64 targets to Intel x86_64
+        run: |
+          set -euxo pipefail
+          cd WaifuX
+          sed -i '' 's/-target arm64-apple-macosx14.4/-target x86_64-apple-macosx14.4/g' scripts/build-wallpaper-video-renderer.sh
+          sed -i '' 's/-target arm64-apple-macosx14.4/-target x86_64-apple-macosx14.4/g' scripts/build-wallpaperengine-cli.sh
+          grep -- '-target ' scripts/build-wallpaper-video-renderer.sh
+          grep -- '-target ' scripts/build-wallpaperengine-cli.sh
+
+      - name: Build Intel renderers
+        run: |
+          set -euxo pipefail
+          cd WaifuX
+          chmod +x scripts/build-wallpaper-video-renderer.sh scripts/build-wallpaperengine-cli.sh
+          ./scripts/build-wallpaper-video-renderer.sh
+          ./scripts/build-wallpaperengine-cli.sh
+
+      - name: Verify x86_64 outputs
+        run: |
+          set -euxo pipefail
+          cd WaifuX
+          file Resources/wallpaper-video-renderer
+          file Resources/wallpaperengine-cli
+          file Resources/wallpaper-video-renderer | grep -q 'x86_64'
+          file Resources/wallpaperengine-cli | grep -q 'x86_64'
+
+      - name: Create Mac-ready ZIP
+        env:
+          VERSION: ${{ inputs.waifux_version }}
+        run: |
+          set -euxo pipefail
+          PKG="WaifuX-Intel-Video-Web"
+          mkdir -p "package/${PKG}"
+          cp WaifuX/Resources/wallpaper-video-renderer "package/${PKG}/"
+          cp WaifuX/Resources/wallpaperengine-cli "package/${PKG}/"
+
+          cat > "package/${PKG}/INSTALL_ON_MAC.command" <<'EOS'
+          #!/bin/bash
+          set -euo pipefail
+          EXPECTED_VERSION="__VERSION__"
+          APP="/Applications/WaifuX.app"
+          DEST="$APP/Contents/Resources/Resources"
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+
+          echo "=== WaifuX Intel Video + Web installer ==="
+
+          [[ "$(uname -m)" == "x86_64" ]] || { echo "ERROR: Intel x86_64 Mac required."; exit 1; }
+          [[ -d "$APP" ]] || { echo "ERROR: $APP not found."; exit 1; }
+          [[ -d "$DEST" ]] || { echo "ERROR: $DEST not found."; exit 1; }
+
+          INSTALLED_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || true)
+          echo "Installed WaifuX version: ${INSTALLED_VERSION:-unknown}"
+          echo "Patch build version:       $EXPECTED_VERSION"
+          [[ "$INSTALLED_VERSION" == "$EXPECTED_VERSION" ]] || { echo "ERROR: Version mismatch. Build the exact same version."; exit 2; }
+
+          for BIN in wallpaper-video-renderer wallpaperengine-cli; do
+            [[ -f "$HERE/$BIN" ]] || { echo "ERROR: Missing $BIN"; exit 1; }
+            file "$HERE/$BIN" | grep -q 'x86_64' || { echo "ERROR: $BIN is not x86_64"; file "$HERE/$BIN"; exit 1; }
+          done
+
+          osascript -e 'tell application "WaifuX" to quit' 2>/dev/null || true
+          pkill -f '/WaifuX.app/' 2>/dev/null || true
+          pkill -f 'wallpaper-video-renderer' 2>/dev/null || true
+          pkill -f 'wallpaperengine-cli' 2>/dev/null || true
+          sleep 2
+
+          STAMP="$(date +%Y%m%d-%H%M%S)"
+          BACKUP="$HOME/Desktop/WaifuX-backup-before-intel-${STAMP}.app"
+          echo "Creating backup: $BACKUP"
+          ditto "$APP" "$BACKUP"
+          printf '%s\n' "$BACKUP" > "$HOME/.waifux_intel_backup_path"
+
+          sudo cp "$HERE/wallpaper-video-renderer" "$DEST/wallpaper-video-renderer"
+          sudo cp "$HERE/wallpaperengine-cli" "$DEST/wallpaperengine-cli"
+          sudo chmod 755 "$DEST/wallpaper-video-renderer" "$DEST/wallpaperengine-cli"
+
+          file "$DEST/wallpaper-video-renderer"
+          file "$DEST/wallpaperengine-cli"
+
+          sudo codesign --force --sign - "$DEST/wallpaper-video-renderer"
+          sudo codesign --force --sign - "$DEST/wallpaperengine-cli"
+          sudo codesign --force --deep --sign - --preserve-metadata=identifier,entitlements,requirements,flags,runtime "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          echo
+          echo "SUCCESS. Test Media video, Wallpaper Engine Video, and Wallpaper Engine Web."
+          echo "Scene is intentionally not patched."
+          EOS
+          sed -i '' "s/__VERSION__/${VERSION}/g" "package/${PKG}/INSTALL_ON_MAC.command"
+
+          cat > "package/${PKG}/CHECK_ON_MAC.command" <<'EOS'
+          #!/bin/bash
+          set -euo pipefail
+          APP="/Applications/WaifuX.app"
+          DEST="$APP/Contents/Resources/Resources"
+          echo "CPU:"; uname -m
+          echo "WaifuX version:"; /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || true
+          echo "Installed binaries:"
+          file "$DEST/wallpaper-video-renderer" 2>/dev/null || true
+          file "$DEST/wallpaperengine-cli" 2>/dev/null || true
+          echo "Scene renderer (not patched):"
+          file "$DEST/wallpaper-wgpu" 2>/dev/null || true
+          EOS
+
+          cat > "package/${PKG}/RESTORE_ORIGINAL.command" <<'EOS'
+          #!/bin/bash
+          set -euo pipefail
+          APP="/Applications/WaifuX.app"
+          POINTER="$HOME/.waifux_intel_backup_path"
+          [[ -f "$POINTER" ]] || { echo "ERROR: No backup pointer found."; exit 1; }
+          BACKUP="$(cat "$POINTER")"
+          [[ -d "$BACKUP" ]] || { echo "ERROR: Backup not found: $BACKUP"; exit 1; }
+          echo "Backup: $BACKUP"
+          read -r -p "Type RESTORE to replace /Applications/WaifuX.app: " ANSWER
+          [[ "$ANSWER" == "RESTORE" ]] || exit 0
+          osascript -e 'tell application "WaifuX" to quit' 2>/dev/null || true
+          pkill -f '/WaifuX.app/' 2>/dev/null || true
+          sleep 2
+          sudo rm -rf "$APP"
+          sudo ditto "$BACKUP" "$APP"
+          echo "Original WaifuX restored."
+          EOS
+
+          cat > "package/${PKG}/README.txt" <<EOF
+          WaifuX Intel Video + Web patch
+          Target WaifuX version: ${VERSION}
+          Target Mac CPU: Intel x86_64
+
+          Included:
+          - wallpaper-video-renderer (x86_64)
+          - wallpaperengine-cli (x86_64)
+          - INSTALL_ON_MAC.command
+          - CHECK_ON_MAC.command
+          - RESTORE_ORIGINAL.command
+
+          Not patched: wallpaper-wgpu / dxc / libdxcompiler.dylib (Scene remains unsupported).
+
+          On the Intel Mac:
+          1. Transfer this INNER ZIP intact to the Mac.
+          2. Extract it on the Mac.
+          3. Open Terminal and cd into the extracted folder.
+          4. Run: bash CHECK_ON_MAC.command
+          5. Confirm the installed WaifuX version is ${VERSION}.
+          6. Run: bash INSTALL_ON_MAC.command
+          7. Enter the Mac administrator password when sudo asks.
+          8. Open WaifuX and test Media video, WE Video, and WE Web.
+          9. To restore: bash RESTORE_ORIGINAL.command
+          EOF
+
+          chmod +x "package/${PKG}/"*.command
+          chmod +x "package/${PKG}/wallpaper-video-renderer" "package/${PKG}/wallpaperengine-cli"
+          cd package
+          /usr/bin/zip -r -X "../WaifuX-Intel-Video-Web-v${VERSION}-macOS-x86_64.zip" "$PKG"
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaifuX-Intel-Video-Web-v${{ inputs.waifux_version }}
+          path: WaifuX-Intel-Video-Web-v${{ inputs.waifux_version }}-macOS-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
