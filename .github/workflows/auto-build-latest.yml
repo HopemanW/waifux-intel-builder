@@ -1,0 +1,182 @@
+name: Auto Build Latest WaifuX Intel Patch
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: waifux-intel-auto-build
+  cancel-in-progress: false
+
+jobs:
+  build-latest:
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Discover latest official WaifuX update
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            https://jipika.github.io/WaifuX/appcast.xml \
+            -o /tmp/waifux-appcast.xml
+
+          VERSION=$(sed -n 's:.*<sparkle:shortVersionString>\([^<]*\)</sparkle:shortVersionString>.*:\1:p' /tmp/waifux-appcast.xml | head -1)
+          DMG_URL=$(sed -n 's:.*url="\([^"]*WaifuX\.dmg\)".*:\1:p' /tmp/waifux-appcast.xml | head -1)
+
+          if [[ -z "$VERSION" || -z "$DMG_URL" ]]; then
+            echo "Could not parse official WaifuX appcast."
+            cat /tmp/waifux-appcast.xml
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=intel-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dmg_url=$DMG_URL" >> "$GITHUB_OUTPUT"
+          echo "Official WaifuX version: $VERSION"
+          echo "Official DMG: $DMG_URL"
+
+      - name: Check whether Intel patch release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.latest.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Intel patch release $RELEASE_TAG already exists. Nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Intel patch release $RELEASE_TAG does not exist yet. Building it."
+          fi
+
+      - name: Show Intel macOS build environment
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euxo pipefail
+          uname -m
+          test "$(uname -m)" = "x86_64"
+          sw_vers
+          xcodebuild -version
+          swiftc --version
+
+      - name: Clone matching upstream WaifuX release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "v${VERSION}" https://github.com/jipika/WaifuX.git WaifuX
+          cd WaifuX
+          echo "VERSION file: $(cat VERSION)"
+          test "$(tr -d '[:space:]' < VERSION)" = "$VERSION"
+
+      - name: Patch helper build targets to Intel x86_64
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euxo pipefail
+          cd WaifuX
+
+          python3 - <<'PY'
+          from pathlib import Path
+          files = [
+              Path('scripts/build-wallpaper-video-renderer.sh'),
+              Path('scripts/build-wallpaperengine-cli.sh'),
+          ]
+          for path in files:
+              text = path.read_text()
+              original = text
+              text = text.replace('-target arm64-apple-macosx', '-target x86_64-apple-macosx')
+              if text == original:
+                  raise SystemExit(f'No arm64 macOS target found in {path}; upstream build script may have changed.')
+              path.write_text(text)
+          PY
+
+          echo "Video renderer target:"
+          grep -- '-target ' scripts/build-wallpaper-video-renderer.sh
+          echo "Wallpaper Engine CLI target:"
+          grep -- '-target ' scripts/build-wallpaperengine-cli.sh
+
+      - name: Build Intel Video and Web helpers
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euxo pipefail
+          cd WaifuX
+          chmod +x scripts/build-wallpaper-video-renderer.sh scripts/build-wallpaperengine-cli.sh
+          ./scripts/build-wallpaper-video-renderer.sh
+          ./scripts/build-wallpaperengine-cli.sh
+
+      - name: Verify x86_64 outputs
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euxo pipefail
+          cd WaifuX
+          file Resources/wallpaper-video-renderer
+          file Resources/wallpaperengine-cli
+          file Resources/wallpaper-video-renderer | grep -q 'x86_64'
+          file Resources/wallpaperengine-cli | grep -q 'x86_64'
+          lipo -archs Resources/wallpaper-video-renderer | grep -qw 'x86_64'
+          lipo -archs Resources/wallpaperengine-cli | grep -qw 'x86_64'
+
+      - name: Package Intel patch
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          set -euxo pipefail
+          PKG="WaifuX-Intel-Patch-v${VERSION}"
+          mkdir -p "package/${PKG}"
+          cp WaifuX/Resources/wallpaper-video-renderer "package/${PKG}/"
+          cp WaifuX/Resources/wallpaperengine-cli "package/${PKG}/"
+          printf '%s\n' "$VERSION" > "package/${PKG}/VERSION.txt"
+
+          cat > "package/${PKG}/README.txt" <<EOF
+          WaifuX Intel Video + Web helper patch
+          Version: ${VERSION}
+          Architecture: x86_64
+
+          Included:
+          - wallpaper-video-renderer
+          - wallpaperengine-cli
+
+          This archive is intended for use by the WaifuX Intel Auto Updater.
+          Wallpaper Engine Scene is not patched.
+          EOF
+
+          chmod 755 "package/${PKG}/wallpaper-video-renderer" "package/${PKG}/wallpaperengine-cli"
+          cd package
+          /usr/bin/zip -r -X "../WaifuX-Intel-Patch-v${VERSION}-macOS-x86_64.zip" "$PKG"
+
+      - name: Publish matching Intel patch release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.latest.outputs.version }}
+          RELEASE_TAG: ${{ steps.latest.outputs.release_tag }}
+          DMG_URL: ${{ steps.latest.outputs.dmg_url }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ZIP="WaifuX-Intel-Patch-v${VERSION}-macOS-x86_64.zip"
+          gh release create "$RELEASE_TAG" "$ZIP" \
+            --title "WaifuX Intel Video + Web Patch ${VERSION}" \
+            --notes "Automatic x86_64 helper build for upstream WaifuX ${VERSION}. Official upstream DMG: ${DMG_URL}. Includes wallpaper-video-renderer and wallpaperengine-cli only; Scene remains unsupported."
+
+      - name: Upload workflow artifact
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: WaifuX-Intel-Patch-v${{ steps.latest.outputs.version }}
+          path: WaifuX-Intel-Patch-v${{ steps.latest.outputs.version }}-macOS-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
