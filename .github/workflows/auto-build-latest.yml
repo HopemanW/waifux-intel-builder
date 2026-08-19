@@ -5,9 +5,10 @@ on:
     paths:
       - '.github/workflows/auto-build-latest.yml'
   schedule:
-    # Check every 15 minutes. The macOS build is only allowed after the
-    # upstream release has been public for at least one hour.
-    - cron: '7,22,37,52 * * * *'
+    # GitHub cron cannot express a true rolling "every 15 days" interval
+    # across months without extra runs/state. To minimize Actions usage, check
+    # twice per month: on the 1st and 16th at 12:17 UTC.
+    - cron: '17 12 1,16 * *'
   workflow_dispatch:
 
 permissions:
