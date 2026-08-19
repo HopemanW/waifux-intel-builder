@@ -5,7 +5,9 @@ on:
     paths:
       - '.github/workflows/auto-build-latest.yml'
   schedule:
-    - cron: '17,47 * * * *'
+    # Check every 15 minutes. The macOS build is only allowed after the
+    # upstream release has been public for at least one hour.
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -16,12 +18,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-latest:
-    runs-on: macos-15-intel
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decision.outputs.should_build }}
+      version: ${{ steps.discover.outputs.version }}
+      release_tag: ${{ steps.discover.outputs.release_tag }}
+      dmg_url: ${{ steps.discover.outputs.dmg_url }}
+      age_seconds: ${{ steps.discover.outputs.age_seconds }}
 
     steps:
-      - name: Discover latest official WaifuX update
-        id: latest
+      - name: Discover latest official WaifuX release
+        id: discover
         shell: bash
         run: |
           set -euo pipefail
@@ -29,44 +37,103 @@ jobs:
             https://jipika.github.io/WaifuX/appcast.xml \
             -o /tmp/waifux-appcast.xml
 
-          # BSD sed treats ':' as the delimiter in s:...:...:, so the ':' in
-          # sparkle:shortVersionString broke the old parser. Use grep plus a
-          # non-conflicting '#' sed delimiter instead.
-          VERSION=$(grep -Eo '<sparkle:shortVersionString>[^<]+' /tmp/waifux-appcast.xml | head -1 | sed 's#.*>##')
-          DMG_URL=$(grep -Eo 'url="[^"]*WaifuX\.dmg"' /tmp/waifux-appcast.xml | head -1 | sed 's#^url="##; s#"$##')
+          python3 - <<'PY'
+          import email.utils
+          import os
+          import time
+          import xml.etree.ElementTree as ET
 
-          if [[ -z "$VERSION" || -z "$DMG_URL" ]]; then
-            echo "Could not parse official WaifuX appcast."
-            cat /tmp/waifux-appcast.xml
-            exit 1
-          fi
+          appcast = ET.parse('/tmp/waifux-appcast.xml').getroot()
+          item = appcast.find('./channel/item')
+          if item is None:
+              raise SystemExit('No <item> found in official WaifuX appcast')
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "upstream_tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "release_tag=intel-v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "dmg_url=$DMG_URL" >> "$GITHUB_OUTPUT"
-          echo "Official WaifuX version: $VERSION"
-          echo "Official DMG: $DMG_URL"
+          version = None
+          dmg_url = None
+          pub_date = None
 
-      - name: Check whether Intel patch release already exists
-        id: existing
+          for child in item:
+              local = child.tag.rsplit('}', 1)[-1]
+              if local == 'shortVersionString' and child.text:
+                  version = child.text.strip()
+              elif local == 'pubDate' and child.text:
+                  pub_date = child.text.strip()
+              elif local == 'enclosure':
+                  url = child.attrib.get('url', '').strip()
+                  if url.endswith('/WaifuX.dmg') or url.endswith('WaifuX.dmg'):
+                      dmg_url = url
+
+          if not version or not dmg_url or not pub_date:
+              raise SystemExit(
+                  f'Could not parse appcast: version={version!r}, '
+                  f'dmg_url={dmg_url!r}, pub_date={pub_date!r}'
+              )
+
+          release_dt = email.utils.parsedate_to_datetime(pub_date)
+          release_epoch = int(release_dt.timestamp())
+          now_epoch = int(time.time())
+          age_seconds = max(0, now_epoch - release_epoch)
+
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as f:
+              f.write(f'version={version}\n')
+              f.write(f'release_tag=intel-v{version}\n')
+              f.write(f'dmg_url={dmg_url}\n')
+              f.write(f'pub_date={pub_date}\n')
+              f.write(f'age_seconds={age_seconds}\n')
+
+          print(f'Official WaifuX version: {version}')
+          print(f'Official release time:   {pub_date}')
+          print(f'Release age:             {age_seconds} seconds')
+          print(f'Official DMG:            {dmg_url}')
+          PY
+
+      - name: Decide whether an Intel build is needed
+        id: decision
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ steps.latest.outputs.release_tag }}
+          VERSION: ${{ steps.discover.outputs.version }}
+          RELEASE_TAG: ${{ steps.discover.outputs.release_tag }}
+          AGE_SECONDS: ${{ steps.discover.outputs.age_seconds }}
         shell: bash
         run: |
           set -euo pipefail
+
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Intel patch release $RELEASE_TAG already exists. Nothing to do."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "Intel patch release $RELEASE_TAG does not exist yet. Building it."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          if (( AGE_SECONDS < 3600 )); then
+            WAIT_SECONDS=$((3600 - AGE_SECONDS))
+            echo "WaifuX $VERSION is new, but the one-hour safety delay has not elapsed."
+            echo "Approximately $WAIT_SECONDS seconds remain before this version is eligible to build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git ls-remote --exit-code --tags \
+            https://github.com/jipika/WaifuX.git \
+            "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "Upstream appcast lists WaifuX $VERSION, but tag v$VERSION is not available yet."
+            echo "Will retry automatically on the next scheduled check."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "WaifuX $VERSION has been public for at least one hour, its tag exists,"
+          echo "and no matching Intel patch release exists yet. Starting Intel build."
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+  build-latest:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: macos-15-intel
+
+    steps:
       - name: Show Intel macOS build environment
-        if: steps.existing.outputs.exists != 'true'
         run: |
           set -euxo pipefail
           uname -m
@@ -76,9 +143,8 @@ jobs:
           swiftc --version
 
       - name: Clone matching upstream WaifuX release
-        if: steps.existing.outputs.exists != 'true'
         env:
-          VERSION: ${{ steps.latest.outputs.version }}
+          VERSION: ${{ needs.check-upstream.outputs.version }}
         run: |
           set -euxo pipefail
           git clone --depth 1 --branch "v${VERSION}" https://github.com/jipika/WaifuX.git WaifuX
@@ -87,7 +153,6 @@ jobs:
           test "$(tr -d '[:space:]' < VERSION)" = "$VERSION"
 
       - name: Patch helper build targets to Intel x86_64
-        if: steps.existing.outputs.exists != 'true'
         run: |
           set -euxo pipefail
           cd WaifuX
@@ -103,7 +168,9 @@ jobs:
               original = text
               text = text.replace('-target arm64-apple-macosx', '-target x86_64-apple-macosx')
               if text == original:
-                  raise SystemExit(f'No arm64 macOS target found in {path}; upstream build script may have changed.')
+                  raise SystemExit(
+                      f'No arm64 macOS target found in {path}; upstream build script may have changed.'
+                  )
               path.write_text(text)
           PY
 
@@ -113,7 +180,6 @@ jobs:
           grep -- '-target ' scripts/build-wallpaperengine-cli.sh
 
       - name: Build Intel Video and Web helpers
-        if: steps.existing.outputs.exists != 'true'
         run: |
           set -euxo pipefail
           cd WaifuX
@@ -122,7 +188,6 @@ jobs:
           ./scripts/build-wallpaperengine-cli.sh
 
       - name: Verify x86_64 outputs
-        if: steps.existing.outputs.exists != 'true'
         run: |
           set -euxo pipefail
           cd WaifuX
@@ -134,9 +199,8 @@ jobs:
           lipo -archs Resources/wallpaperengine-cli | grep -qw 'x86_64'
 
       - name: Package Intel patch
-        if: steps.existing.outputs.exists != 'true'
         env:
-          VERSION: ${{ steps.latest.outputs.version }}
+          VERSION: ${{ needs.check-upstream.outputs.version }}
         run: |
           set -euxo pipefail
           PKG="WaifuX-Intel-Patch-v${VERSION}"
@@ -162,27 +226,42 @@ jobs:
           cd package
           /usr/bin/zip -r -X "../WaifuX-Intel-Patch-v${VERSION}-macOS-x86_64.zip" "$PKG"
 
-      - name: Publish matching Intel patch release
-        if: steps.existing.outputs.exists != 'true'
+      - name: Re-check release race before publishing
+        id: race
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ steps.latest.outputs.version }}
-          RELEASE_TAG: ${{ steps.latest.outputs.release_tag }}
-          DMG_URL: ${{ steps.latest.outputs.dmg_url }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "A matching Intel release was created while this job was building."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish matching Intel patch release
+        if: steps.race.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check-upstream.outputs.version }}
+          RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+          DMG_URL: ${{ needs.check-upstream.outputs.dmg_url }}
         shell: bash
         run: |
           set -euxo pipefail
           ZIP="WaifuX-Intel-Patch-v${VERSION}-macOS-x86_64.zip"
           gh release create "$RELEASE_TAG" "$ZIP" \
             --title "WaifuX Intel Video + Web Patch ${VERSION}" \
-            --notes "Automatic x86_64 helper build for upstream WaifuX ${VERSION}. Official upstream DMG: ${DMG_URL}. Includes wallpaper-video-renderer and wallpaperengine-cli only; Scene remains unsupported."
+            --notes "Automatic x86_64 helper build for upstream WaifuX ${VERSION}, intentionally delayed until the official release has been public for at least one hour. Official upstream DMG: ${DMG_URL}. Includes wallpaper-video-renderer and wallpaperengine-cli only; Scene remains unsupported."
 
       - name: Upload workflow artifact
-        if: steps.existing.outputs.exists != 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: WaifuX-Intel-Patch-v${{ steps.latest.outputs.version }}
-          path: WaifuX-Intel-Patch-v${{ steps.latest.outputs.version }}-macOS-x86_64.zip
+          name: WaifuX-Intel-Patch-v${{ needs.check-upstream.outputs.version }}
+          path: WaifuX-Intel-Patch-v${{ needs.check-upstream.outputs.version }}-macOS-x86_64.zip
           if-no-files-found: error
           retention-days: 14
