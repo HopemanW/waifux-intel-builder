@@ -33,7 +33,7 @@ trap 'rm -f "$TMP"' EXIT
 [[ "$(uname -m)" == "x86_64" ]] || exit 0
 curl -fsSL --retry 2 "$APPCAST" -o "$TMP" || exit 0
 
-LATEST=$(sed -n 's:.*<sparkle:shortVersionString>\([^<]*\)</sparkle:shortVersionString>.*:\1:p' "$TMP" | head -1)
+LATEST=$(grep -Eo '<sparkle:shortVersionString>[^<]+' "$TMP" | head -1 | sed 's#.*>##')
 [[ -n "$LATEST" ]] || exit 0
 
 INSTALLED="none"
@@ -53,7 +53,6 @@ fi
 PATCH_URL="https://github.com/${REPO}/releases/download/intel-v${LATEST}/WaifuX-Intel-Patch-v${LATEST}-macOS-x86_64.zip"
 curl -fsIL --retry 1 "$PATCH_URL" >/dev/null 2>&1 || exit 0
 
-# Avoid repeatedly interrupting the user. If postponed, ask again after 6 hours.
 NOW=$(date +%s)
 if [[ -f "$STATE" ]]; then
   IFS='|' read -r OLD_VERSION OLD_TIME < "$STATE" || true
@@ -65,7 +64,6 @@ fi
 
 printf '%s|%s\n' "$LATEST" "$NOW" > "$STATE"
 
-# Refresh the updater itself before offering the update.
 if curl -fsSL --retry 2 "$RAW_UPDATER" -o "$UPDATER.tmp"; then
   mv "$UPDATER.tmp" "$UPDATER"
   chmod 755 "$UPDATER"
