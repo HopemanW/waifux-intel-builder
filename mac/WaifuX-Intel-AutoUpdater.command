@@ -49,8 +49,11 @@ mkdir -p "$BACKUP_DIR"
 say "Checking the official WaifuX update feed"
 curl -fsSL --retry 3 --retry-delay 2 "$APPCAST_URL" -o "$TMP/appcast.xml"
 
-LATEST_VERSION=$(sed -n 's:.*<sparkle:shortVersionString>\([^<]*\)</sparkle:shortVersionString>.*:\1:p' "$TMP/appcast.xml" | head -1)
-DMG_URL=$(sed -n 's:.*url="\([^"]*WaifuX\.dmg\)".*:\1:p' "$TMP/appcast.xml" | head -1)
+# Do not use ':' as a sed delimiter here: BSD sed treats the ':' in the
+# Sparkle XML namespace as the end of the pattern. grep + '#' delimited sed
+# works on the stock macOS toolchain and on GitHub's Intel macOS runner.
+LATEST_VERSION=$(grep -Eo '<sparkle:shortVersionString>[^<]+' "$TMP/appcast.xml" | head -1 | sed 's#.*>##')
+DMG_URL=$(grep -Eo 'url="[^"]*WaifuX\.dmg"' "$TMP/appcast.xml" | head -1 | sed 's#^url="##; s#"$##')
 
 if [[ -z "$LATEST_VERSION" || -z "$DMG_URL" ]]; then
   echo "ERROR: Could not parse the official WaifuX appcast."
@@ -171,7 +174,6 @@ sudo rm -rf "$APP"
 sudo ditto "$NEW_APP" "$APP"
 REPLACED_APP=1
 
-# Verify the pristine official copy one more time before modifying it.
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 DEST="$APP/Contents/Resources/Resources"
@@ -189,9 +191,6 @@ file "$DEST/wallpaper-video-renderer"
 file "$DEST/wallpaperengine-cli"
 
 say "Disabling Sparkle automatic installation for the locally re-signed build"
-# Once we modify and ad-hoc sign WaifuX, its signing identity no longer matches the
-# upstream Developer ID identity. Sparkle will reject a future in-app update.
-# The external Intel updater watches the exact same official appcast instead.
 sudo /usr/libexec/PlistBuddy -c "Set :SUEnableAutomaticChecks false" "$APP/Contents/Info.plist" 2>/dev/null || true
 
 say "Re-signing the Intel-modified WaifuX"
@@ -220,7 +219,6 @@ fi
 
 REPLACED_APP=0
 
-# Keep only the newest three backups.
 ls -1dt "$BACKUP_DIR"/WaifuX-*.app 2>/dev/null | tail -n +4 | while IFS= read -r old; do
   rm -rf "$old" || true
 done
