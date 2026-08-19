@@ -1,6 +1,9 @@
 name: Auto Build Latest WaifuX Intel Patch
 
 on:
+  push:
+    paths:
+      - '.github/workflows/auto-build-latest.yml'
   schedule:
     - cron: '17,47 * * * *'
   workflow_dispatch:
@@ -26,8 +29,11 @@ jobs:
             https://jipika.github.io/WaifuX/appcast.xml \
             -o /tmp/waifux-appcast.xml
 
-          VERSION=$(sed -n 's:.*<sparkle:shortVersionString>\([^<]*\)</sparkle:shortVersionString>.*:\1:p' /tmp/waifux-appcast.xml | head -1)
-          DMG_URL=$(sed -n 's:.*url="\([^"]*WaifuX\.dmg\)".*:\1:p' /tmp/waifux-appcast.xml | head -1)
+          # BSD sed treats ':' as the delimiter in s:...:...:, so the ':' in
+          # sparkle:shortVersionString broke the old parser. Use grep plus a
+          # non-conflicting '#' sed delimiter instead.
+          VERSION=$(grep -Eo '<sparkle:shortVersionString>[^<]+' /tmp/waifux-appcast.xml | head -1 | sed 's#.*>##')
+          DMG_URL=$(grep -Eo 'url="[^"]*WaifuX\.dmg"' /tmp/waifux-appcast.xml | head -1 | sed 's#^url="##; s#"$##')
 
           if [[ -z "$VERSION" || -z "$DMG_URL" ]]; then
             echo "Could not parse official WaifuX appcast."
