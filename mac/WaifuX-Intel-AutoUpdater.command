@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP="/Applications/WaifuX.app"
 APPCAST_URL="https://jipika.github.io/WaifuX/appcast.xml"
-PATCH_REPO="HopemanW/waifux-intel-builder"
+PATCH_REPO="ZhiWang-Andy/waifux-intel-builder"
 SUPPORT_DIR="$HOME/Library/Application Support/WaifuX Intel Updater"
 BACKUP_DIR="$SUPPORT_DIR/Backups"
 TMP="$(mktemp -d /tmp/waifux-intel-update.XXXXXX)"
