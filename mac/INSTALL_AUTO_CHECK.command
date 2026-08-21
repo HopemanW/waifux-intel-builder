@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO="HopemanW/waifux-intel-builder"
+REPO="ZhiWang-Andy/waifux-intel-builder"
 SUPPORT_DIR="$HOME/Library/Application Support/WaifuX Intel Updater"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 PLIST="$LAUNCH_AGENTS/com.hopemanw.waifux-intel-updater.plist"
@@ -22,7 +22,7 @@ set -u
 
 APP="/Applications/WaifuX.app"
 APPCAST="https://jipika.github.io/WaifuX/appcast.xml"
-REPO="HopemanW/waifux-intel-builder"
+REPO="ZhiWang-Andy/waifux-intel-builder"
 SUPPORT_DIR="$HOME/Library/Application Support/WaifuX Intel Updater"
 UPDATER="$SUPPORT_DIR/WaifuX-Intel-AutoUpdater.command"
 STATE="$SUPPORT_DIR/last-prompt.txt"
