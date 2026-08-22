@@ -63,7 +63,7 @@ git checkout "$UPSTREAM_COMMIT"
 git submodule sync --recursive
 git submodule update --init --recursive
 
-echo "Applying Intel/macOS compatibility patch..."
+echo "Applying Intel/macOS compatibility + diagnostics patch..."
 python3 - "$SRC" <<'PY'
 from pathlib import Path
 import sys
@@ -94,6 +94,14 @@ if marker not in text:
     raise SystemExit("Could not locate [[example]] marker in Cargo.toml")
 linux_block = "\n[target.'cfg(target_os = \"linux\")'.dependencies]\n" + "\n".join(linux_deps) + "\n"
 text = text.replace(marker, linux_block + marker, 1)
+
+# Diagnostic build: upstream release profile uses panic=abort + strip=true.
+# That makes texture-thread catch_unwind ineffective and removes useful symbols.
+# For Intel bring-up we want panics to unwind, backtraces to contain symbols,
+# and the renderer to report the failing stage instead of only producing SIGABRT.
+text = text.replace('debug = false', 'debug = true', 1)
+text = text.replace('strip = true', 'strip = false', 1)
+text = text.replace('panic = "abort"', 'panic = "unwind"', 1)
 cargo.write_text(text)
 
 # 2) Do not compile the wlr/Wayland adapter on macOS.
@@ -135,16 +143,122 @@ if needle not in app.read_text():
     raise SystemExit("Could not locate required-feature block in app.rs")
 text = app.read_text().replace(
     needle,
-    '        eprintln!("[scene-experimental] WGPU adapter: {:?}", adapter.get_info());\n\n' + needle,
+    '        eprintln!("[scene-experimental] WGPU adapter: {:?}", adapter.get_info());\n'
+    '        eprintln!("[scene-experimental] WGPU features: {:?}", adapter.features());\n'
+    '        eprintln!("[scene-experimental] WGPU limits: {:?}", adapter.limits());\n\n' + needle,
     1,
 )
 app.write_text(text)
 
-print("macOS patch applied successfully")
+# 5) Catch renderer initialization/load panics inside the winit callback.
+# This is especially important on macOS because an uncaught panic during an
+# AppKit callback otherwise surfaces as a generic Abort trap crash report.
+winit = root / "src/scene/adapters/winit_adapter.rs"
+text = winit.read_text()
+old = '''        let mut wgpu_app = block_on(WgpuApp::new(
+            self.pkg_path.clone(),
+            crate::scene::renderer::app::InitAppSurface::Winit(Arc::clone(&window)),
+            [size.width, size.height],
+            self.no_effects,
+            self.no_mdl,
+            self.assets_path.clone(),
+            self.show_progress,
+        ));
+
+        wgpu_app.load();
+
+        self.app.lock().unwrap().replace(wgpu_app);
+        self.window = Some(window);'''
+new = '''        eprintln!("[scene-experimental] phase=wgpu_init begin");
+        let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(WgpuApp::new(
+                self.pkg_path.clone(),
+                crate::scene::renderer::app::InitAppSurface::Winit(Arc::clone(&window)),
+                [size.width, size.height],
+                self.no_effects,
+                self.no_mdl,
+                self.assets_path.clone(),
+                self.show_progress,
+            ))
+        }));
+
+        let mut wgpu_app = match init {
+            Ok(app) => {
+                eprintln!("[scene-experimental] phase=wgpu_init ok");
+                app
+            }
+            Err(payload) => {
+                eprintln!("[scene-experimental] phase=wgpu_init PANIC: {}", panic_payload(&payload));
+                event_loop.exit();
+                return;
+            }
+        };
+
+        eprintln!("[scene-experimental] phase=scene_load begin");
+        let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wgpu_app.load();
+        }));
+        if let Err(payload) = load {
+            eprintln!("[scene-experimental] phase=scene_load PANIC: {}", panic_payload(&payload));
+            event_loop.exit();
+            return;
+        }
+        eprintln!("[scene-experimental] phase=scene_load ok");
+
+        self.app.lock().unwrap().replace(wgpu_app);
+        self.window = Some(window);
+        self.window.as_ref().unwrap().request_redraw();'''
+if old not in text:
+    raise SystemExit("Could not locate WgpuApp init/load block in winit_adapter.rs")
+text = text.replace(old, new, 1)
+insert = '''
+fn panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+'''
+marker = 'struct WinitApp {'
+if marker not in text:
+    raise SystemExit("Could not locate WinitApp marker")
+text = text.replace(marker, insert + marker, 1)
+winit.write_text(text)
+
+# 6) Add explicit load-stage markers so a failing subsystem is obvious.
+load = root / "src/scene/renderer/load.rs"
+text = load.read_text()
+repls = [
+    ('        let mut scene = Scene::new(self.scene_path.clone(), self.show_progress);',
+     '        eprintln!("[scene-experimental] load=package begin");\n        let mut scene = Scene::new(self.scene_path.clone(), self.show_progress);\n        eprintln!("[scene-experimental] load=package ok objects={} textures={}", scene.root.objects.len(), scene.textures.len());'),
+    ('        let post_process =\n            PostProcess::new(&self.device, &self.queue, size, self.has_clear_texture);',
+     '        eprintln!("[scene-experimental] load=post_process begin size={}x{}", size[0], size[1]);\n        let post_process =\n            PostProcess::new(&self.device, &self.queue, size, self.has_clear_texture);\n        eprintln!("[scene-experimental] load=post_process ok");'),
+    ('        let (pipeline, copy_pipeline) = create_pipelines(&self, &post_process.layout);',
+     '        eprintln!("[scene-experimental] load=base_pipelines begin");\n        let (pipeline, copy_pipeline) = create_pipelines(&self, &post_process.layout);\n        eprintln!("[scene-experimental] load=base_pipelines ok");'),
+    ('        let objects = ObjectMap::with_clear_color(',
+     '        eprintln!("[scene-experimental] load=object_map begin");\n        let objects = ObjectMap::with_clear_color('),
+    ('        // Pre-compute total geometry so we can allocate GPU buffers once.',
+     '        eprintln!("[scene-experimental] load=object_map ok textures={} audio={}", objects.texture.len(), objects.audio.len());\n\n        // Pre-compute total geometry so we can allocate GPU buffers once.'),
+    ('        let draw_queue = DrawQueue::new(',
+     '        eprintln!("[scene-experimental] load=draw_queue begin");\n        let draw_queue = DrawQueue::new('),
+    ('        load_audios(&self.audio_stream, objects.audio, &scene);',
+     '        eprintln!("[scene-experimental] load=draw_queue ok");\n        eprintln!("[scene-experimental] load=audio begin");\n        load_audios(&self.audio_stream, objects.audio, &scene);\n        eprintln!("[scene-experimental] load=audio ok");'),
+]
+for old, new in repls:
+    if old not in text:
+        raise SystemExit(f"Could not locate load.rs diagnostic insertion pattern: {old[:70]}")
+    text = text.replace(old, new, 1)
+load.write_text(text)
+
+print("macOS compatibility + diagnostics patch applied successfully")
 PY
 
 echo
-echo "Building x86_64 Rust/wgpu renderer..."
+echo "Building diagnostic x86_64 Rust/wgpu renderer..."
 export CARGO_TERM_COLOR=always
 cargo build --release --target x86_64-apple-darwin
 
@@ -166,4 +280,5 @@ echo "Build complete."
 echo "Binary:"
 echo "  $OUT_BIN"
 echo
+echo "This diagnostic build keeps symbols and panic unwinding enabled."
 echo "Next: run mac/RUN_SCENE_A.command against the transferred A-basic test scene."
